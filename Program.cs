@@ -9,42 +9,73 @@ namespace PollyDemo
 {
     class Program
     {
-        static void Main(string[] args)
-        {
-            var data = QueryData();
-            var options = new JsonSerializerOptions {
-                WriteIndented = true
-            };
-            Console.WriteLine(JsonSerializer.Serialize(data, options));
-        }
 
         public class Entry
         {
             public Guid Id { get; set; }
             public string Subject { get; set; }
         }
-        static IEnumerable<Entry> Get3rdPtyData(string srcName, int delayTime)
+        static IEnumerable<Entry> Call3rdApi(string srcName, int delayTime)
         {
             Task.Delay(delayTime * 1000).Wait();
-            return Enumerable.Range(1, 1).Select(o =>
+            return Enumerable.Range(1, 2).Select(o =>
                  new Entry
                  {
                      Id = Guid.NewGuid(),
                      Subject = $"Data from ExtraData[{srcName}] {DateTime.Now.Ticks % 100000:00000}"
                  });
         }
-
-        static Dictionary<string, Func<IEnumerable<Entry>>> extDataJobs = 
+        static Dictionary<string, Func<IEnumerable<Entry>>> extDataJobs =
             new Dictionary<string, Func<IEnumerable<Entry>>>
             {
-                ["SrcA"] = () => Get3rdPtyData("A", 3),
-                ["SrcB"] = () => Get3rdPtyData("B", 8),
+                ["SrcA"] = () => Call3rdApi("A", 3),
+                ["SrcB"] = () => Call3rdApi("B", 8),
                 ["SrcC"] = () => { throw new ApplicationException("Error"); }
             };
+
+        static void Main(string[] args)
+        {
+            PreparePolicy();
+            var data = QueryData();
+            var options = new JsonSerializerOptions
+            {
+                WriteIndented = true
+            };
+            Console.WriteLine(JsonSerializer.Serialize(data, options));
+        }
+
+        static Polly.Wrap.PolicyWrap<IEnumerable<Entry>> policy = null;
+        static void PreparePolicy()
+        {
+            var timeoutPolicy =
+                Policy.Timeout(TimeSpan.FromSeconds(5), Polly.Timeout.TimeoutStrategy.Pessimistic);
+            var timeoutFallbackPolicy = Policy<IEnumerable<Entry>>
+                .Handle<Polly.Timeout.TimeoutRejectedException>()
+                .Fallback((context) =>
+                    new List<Entry>() {
+                                new Entry
+                                {
+                                    Id = Guid.NewGuid(),
+                                    Subject = $"Warning: [{context["Src"]}] API timeout"
+                                }
+                    }, onFallback: (ex, ctx) => { });
+            var fallbackPolicy = Policy<IEnumerable<Entry>>.Handle<Exception>()
+                .Fallback((context) =>
+                    new List<Entry>() {
+                                new Entry
+                                {
+                                    Id = Guid.NewGuid(),
+                                    Subject = $"Warning: [{context["Src"]}] API failed"
+                                }
+                    }, onFallback: (ex, ctx) => { });
+
+            policy = fallbackPolicy.Wrap(timeoutFallbackPolicy).Wrap(timeoutPolicy);
+        }
+
         static IEnumerable<Entry> QueryData()
         {
             var list = new List<Entry>();
-            //Simulate data from local
+            //database query simulation
             list.Add(new Entry
             {
                 Id = Guid.NewGuid(),
@@ -53,34 +84,12 @@ namespace PollyDemo
 
             Parallel.ForEach(extDataJobs.Keys, (src) =>
             {
-                var policyTimeout = 
-                    Policy.Timeout(TimeSpan.FromSeconds(5), Polly.Timeout.TimeoutStrategy.Pessimistic);
-                var policyTimeoutFallback = Policy<IEnumerable<Entry>>
-                    .Handle<Polly.Timeout.TimeoutRejectedException>()
-                    .Fallback(() =>
-                        new List<Entry>() {
-                            new Entry
-                            {
-                                Id = Guid.NewGuid(),
-                                Subject = $"Warning: [{src}] API timeout"
-                            }
-                    });
-                var policyFail = Policy<IEnumerable<Entry>>.Handle<Exception>().Fallback(() =>
-                {
-                    return new List<Entry>() {
-                        new Entry
-                        {
-                            Id = Guid.NewGuid(),
-                            Subject = $"Warning: [{src}] API failed"
-                        }
-                    };
-                });
-
-                var policyWrap = policyFail.Wrap(policyTimeoutFallback).Wrap(policyTimeout);
-
-                var extData = policyWrap.Execute(() =>
+                var extData = policy.Execute((context) =>
                 {
                     return extDataJobs[src]();
+                }, contextData: new Dictionary<string, object>
+                {
+                    ["Src"] = src
                 });
                 lock (list)
                 {
